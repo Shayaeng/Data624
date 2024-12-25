@@ -1,0 +1,157 @@
+---
+title: "Project 1"
+subtitle: "S03 Var05, S03 Var07, S05 Var03"
+author: "Group 3: Shaya Engelman, Julia Ferris, Amanda Fox, Jean Jimenez"
+date: "2024-06-23"
+output: word_document
+always_allow_html: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(include = FALSE)
+```
+
+```{r}
+setwd("C:/Users/shaya/OneDrive/Documents/repos/Data624")
+```
+
+```{r}
+library(tidyverse)
+library(readxl)
+library(here)
+library(tsibble)
+library(fable)
+library(ggcorrplot)
+library(forecast)
+library(tseries)
+library(zoo)
+library(writexl)
+library(prophet)
+library(knitr)
+library(kableExtra)
+```
+
+# Introduction
+
+This project is an attempt to forecast various variables in a dataset. The dataset is completely deidentified and contains 6 'categories' with 5 time series for each category. The dataset consists of of 1622 observations and another 140 empty observations to be forecasted.
+
+Here, the focus is on forecasting the variables S03 Var05, S03 Var07, and S05 Var03. 
+
+# S03
+
+## Data
+
+The data is loaded and the category of interest is extracted. The following table is the first 6 rows of the data. The SeriesInd column is the index of the time series, the other columns are the various time series. As mentioned, the data, including the index is completely deidentified, so the actual meaning of both the variables and what the time step being measured is unknown.
+
+```{r}
+complete_data <- read_excel(here("Project_1", "Prompt", "Data Set for Class.xls"))
+
+# Split the data into 6 different data frames by the column "category"
+data_list <- split(complete_data, complete_data$category)
+
+# Extract category three
+category_three <- data_list$`S03` |>
+    select(-category) # drop the category column
+
+summary(category_three)
+```
+```{r, include=TRUE, echo=FALSE}
+kable(head(category_three), caption = "First 6 rows of the S03 data")
+```
+
+While only two variables, Var05 and Var07, are of interest, is is importnant to take a glance at the other variables in the dataset. By visualizing the time series and the correlation between the variables, it becomes apparent that many of these variables are not just highly correlated, but also have almost identical patterns. In particular, the two variables of interest, Var05 and Var07, seem to be almost identical. Only Var02 seems to be onan entirely different order of magnitude with much less correlation to the other variables.
+
+```{r, include=TRUE, echo=FALSE}
+# Plot the five variables as faceted plots to allow for different scales on the y-axis
+category_three |>
+  pivot_longer(cols = -SeriesInd, names_to = "variable", values_to = "value") |>
+  ggplot(aes(x = SeriesInd, y = value, color = variable)) +
+  geom_line() +
+  labs(title = "Time Series Plot", x = "Date", y = "Value", color = "Variable") +
+  theme_minimal() +
+  facet_wrap(~ variable, scales = "free_y", ncol = 1)
+
+```{r, include=TRUE, echo=FALSE, warning=FALSE}
+# Compute correlation matrix
+category_three |>
+  select(Var01, Var02, Var03, Var05, Var07) |>
+  na.omit() |> # cor() does not handle missing values
+  cor() |>
+  ggcorrplot(lab = TRUE)
+```
+
+The summary statistics reveal some interesting information. The two variables of interest, Var05 and Var07, have almost identical values for the mean, median, and standard deviation. The minimum and maximum values are also very similar.
+
+Since the data is completely deidentified, it is not known what the 'SeriesInd' column represents. The actual values appear to be Excel date serials (the number of days since December 30, 1899), but since this is not confirmed, it will be left as a blank index unless there is a reason to change it. An interesting insight from the summary statistics
+
+There are 144 missing values for both 'Var05' and 'Var07'. The majority of the missing values are in the last 140 rows of the dataset, which are the rows to be forecasted. There are 4 rows of missing data in the first 1482 rows. By checking those rows, it is observed that both 'Var05' and 'Var07' are missing for the same rows. This does not allow us to use the other variable to fill in the missing values. Since there are only 4 rows out of 1622 missing, the method of imputation should not have a significant impact on the forecast. The method chosen was to use an interpolation method to fill in the missing values with the average of the two closest non-missing values.
+
+```{r, include=TRUE, echo=FALSE, warning=FALSE}
+cat3_var5_var7 <- category_three |>
+  select(SeriesInd, Var05, Var07)
+
+# Convert to tsibble
+cat3_var5_var7 <- as_tsibble(cat3_var5_var7, index = SeriesInd) 
+
+# Check the tsibble object
+length(cat3_var5_var7$SeriesInd)
+
+# Summary statistics
+summary <- summary(cat3_var5_var7)
+
+# Pivot the summary
+kbl(summary) %>%
+  kable_styling(latex_options = "hold_position") %>%
+  column_spec(1, bold = TRUE) %>%
+  row_spec(0, bold = TRUE)
+```
+```{r}
+# Remove last 140 rows
+n <- nrow(cat3_var5_var7)
+cat3_train <- cat3_var5_var7[-c((n-139):n), ]
+
+# Print the rows of missing values
+cat3_train |>
+  filter(is.na(Var05) | is.na(Var07))
+
+# Impute missing values
+cat3_train$Var05 <- na.approx(cat3_train$Var05)
+cat3_train$Var07 <- na.approx(cat3_train$Var07)
+
+# Check for missing values to make sure they were filled in
+cat3_train |>
+  filter(is.na(Var05) | is.na(Var07))
+```
+
+Additionally, to fill in the implicitly missing rows to make the data continuous, a different imputation method was used. For this, the rows were filled with the most recent non-missing value. This method was chosen because the data appears to have zero change for those observations based on the reasoning why they might be missing, such as only operaing on business days.
+
+```{r}
+# Add the implicitly missing rows
+cat3_train <- cat3_train |> 
+  fill_gaps()
+
+# Fill NAs with the last value
+cat3_train$Var05 <- na.locf(cat3_train$Var05)
+cat3_train$Var07 <- na.locf(cat3_train$Var07)
+
+# Check for missing values
+cat3_train |>
+  filter(is.na(Var05) | is.na(Var07))
+```
+
+The individual time series for 'Var05' and 'Var07' are plotted below and it is noted that there does not seem to be any major outliers that need to be addressed. The data does display an overall upward trend with significant variability. Initially, the data seems to have very minor fluctuationsm, but later on, the variability increases significantly. Additionally, the data seems to have an either seasonal or cyclical component, with the data appearing to have a pattern of peaks and valleys.
+
+```{r, include=TRUE, echo=FALSE, warning=FALSE}
+# Save as separate time series objects
+var5 <- ts(cat3_train$Var05)
+var7 <- ts(cat3_train$Var07)
+
+# Plot the two variables
+ggplot() +
+  geom_point(aes(x = cat3_train$SeriesInd, y = var5), color = "blue", alpha = 0.95) +
+  geom_point(aes(x = cat3_train$SeriesInd, y = var7), color = "red", alpha = 0.5) +
+  labs(title = "Time Series Plot", x = "Date", y = "Value", color = "Variable") +
+  theme_minimal()
+```
+
+## Data Preparation

@@ -1,0 +1,166 @@
+---
+title: "KJ 6.3"
+author: "Group 3"
+date: "`r Sys.Date()`"
+output: word_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = F)
+```
+
+```{r, echo=F, message=FALSE}
+library(tidyverse)
+library(AppliedPredictiveModeling)
+library(caret)
+```
+
+# 6.3 Chemical Manufacturing
+
+**A chemical manufacturing process for a pharmaceutical product was discussed in Sect.1.4. In this problem, the objective is to understand the relationship between biological measurements of the raw materials (predictors),measurements of the manufacturing process (predictors), and the response of product yield. Biological predictors cannot be changed but can be used to assess the quality of the raw material before processing. On the other hand, manufacturing process predictors can be changed in the manufacturing pro- cess. Improving product yield by 1% will boost revenue by approximately one hundred thousand dollars per batch**
+
+## 1.
+
+**Start R and use these commands to load this data. The matrix processPredictors contains the 57 predictors (12 describing the input biological material and 45 describing the process predictors) for the 176 manufacturing runs. `yield` contains the percent yield for each run.**
+
+```{r}
+data(ChemicalManufacturingProcess)
+dim(ChemicalManufacturingProcess)
+```
+
+## 2.
+
+**A small percentage of cells in the predictor set contain missing values. Use an imputation function to fill in these missing values (e.g., see Sect. 3.8).**
+
+In order to determine a valid imputation method, it is important to visualize the data. Different distributions require different methods of imputation
+
+```{r}
+# Check the distributions of the columns with missing values
+cols_with_missing_values <- colnames(ChemicalManufacturingProcess)[apply(ChemicalManufacturingProcess, 2, function(x) any(is.na(x)))]
+
+# Reshape the data to long format
+long_data <- ChemicalManufacturingProcess %>%
+  select(all_of(cols_with_missing_values)) %>%
+  pivot_longer(cols = everything(), names_to = "variable", values_to = "value")
+
+# Create density plots of those columns
+ggplot(long_data, aes(x = value)) +
+  geom_density() +
+  facet_wrap(~ variable, scales = "free") +
+  labs(title = "Density Plots of Variables with Missing Values") +
+  theme_minimal()
+```
+
+Given that each variable has a unique distribution that may respond differently to various imputation methods, I've decided to employ the k-nearest neighbors imputation method. This method is quite robust and can accommodate a wide range of distributions. If a specific column had a more substantial percentage of missing values, I would have chosen an imputation method better suited to that column's distribution. However, as the missing values are minimal, I will proceed with a general and robust method.
+
+```{r}
+imputed_data <- preProcess(ChemicalManufacturingProcess, method = 'knnImpute')
+complete_data <- predict(imputed_data, ChemicalManufacturingProcess)
+# Check if there are any missing values
+any(is.na(complete_data))
+```
+
+There is no longer any miissing data in the dataset.
+
+## 3.
+
+**Split the data into a training and a test set, pre-process the data, and tune a model of your choice from this chapter. What is the optimal value of the performance metric?**
+
+```{r}
+# Split the data into training and test sets
+set.seed(1125)
+splitIndex <- createDataPartition(complete_data$Yield, p = 0.70, list = F)
+train_data <- complete_data[splitIndex, ]
+test_data <- complete_data[-splitIndex, ]
+```
+
+```{r}
+set.seed(1125)
+# Define training control with preprocessing and cross-validation
+train_control <- trainControl(method = "cv", number = 10, preProcOptions = c("center", "scale", "nzv"))
+
+# Train the PLS model with preprocessing and cross-validation
+pls_model <- train(Yield ~ ., 
+                   data = train_data, 
+                   method = "pls", 
+                   metric = "RMSE",
+                   trControl = train_control)
+
+# Print the model results
+print(pls_model)
+```
+
+The optimal value of the performance metric, RMSE, is *0.654*.
+
+## 4.
+
+**Predict the response for the test set. What is the value of the performance metric and how does this compare with the resampled performance metric on the training set?**
+
+```{r}
+set.seed(1125)
+# Predict on the test set
+test_predictions <- predict(pls_model, newdata = test_data)
+
+# Calculate RMSE on the test set
+test_rmse <- sqrt(mean((test_data$Yield - test_predictions)^2))
+
+# Compare with resampled performance metric on training set
+resampled_rmse <- min(pls_model$results$RMSE)
+
+# Print the results
+cat("Performance Metric (RMSE) on Test Set:", test_rmse, "\n")
+cat("Resampled Performance Metric (RMSE) on Training Set:", resampled_rmse, "\n")
+```
+
+The performance metric (RMSE) on the test set is *0.624* and the resampled performance metric (RMSE) on the training set is *0.654*. Overall, similar enough to suggest the model is generalizing well and stable.
+
+## 5.
+
+**Which predictors are most important in the model you have trained? Do either the biological or process predictors dominate the list?**
+
+```{r}
+importance <- varImp(pls_model)
+importance
+```
+
+```{r}
+# Assess dominance of biological vs. process predictors
+biological_predictors <- subset(importance$importance, grepl("Biological", rownames(importance$importance)))
+process_predictors <- subset(importance$importance, grepl("Process", rownames(importance$importance)))
+
+# Print dominance assessment
+cat("Biological Predictors Dominance:", sum(biological_predictors), "\n")
+cat("Process Predictors Dominance:", sum(process_predictors), "\n")
+```
+
+Viewing the top 20 predictors shows 12 process predictors and 8 biological predictors. Moreover, the first 5 predictors are all process predictors. This suggests that the process predictors dominate the list of important predictors in the model. Calculating the dominance of the predictors confirms this, with the process predictors having a dominance score of 1364 compared to the biological predictors' dominance score of 572.
+
+## 6.
+
+**Explore the relationships between each of the top predictors and the response. How could this information be helpful in improving yield in future runs of the manufacturing process?**
+
+```{r}
+# Get the top 5 predictors
+top_5_predictors <- rownames(importance$importance)[order(importance$importance$Overall, decreasing = TRUE)[1:5]]
+
+long_data <- train_data %>%
+  select(all_of(top_5_predictors), Yield) %>%
+  pivot_longer(cols = -Yield, names_to = "variable", values_to = "value")
+
+# Create scatter plots of the top predictors
+ggplot(long_data, aes(x = value, y = Yield)) +
+  geom_point() +
+  geom_smooth(method = "lm", se = FALSE, color = "blue") +
+  facet_wrap(~ variable, scales = "free") +
+  labs(title = "Relationships Between Top Predictors and Yield") +
+  theme_minimal()
+```
+
+```{r}
+# correlation matrix
+correlation_matrix <- cor(train_data[, c(top_5_predictors, "Yield")])
+cor_yield <- correlation_matrix["Yield", -length(correlation_matrix)]
+cor_yield
+```
+
+Since I do not know anything about the data or the processes, I am not looking at correlation between the predictors. I am only focusing on the relationship between the predictors and the response variable. Both the plots and the correltion matrix clearly reveal some of the top predictors hve a strong positive relationship with the response variable, while others have a negative relationship. Without knowing anything about the data, the obvious recommendation would be to increase the predictors with a positive relationship and decrease the predictors with a negative relationship. However, this is a very simplistic view and may not be the best course of action.

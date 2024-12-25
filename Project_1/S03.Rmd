@@ -1,0 +1,523 @@
+---
+title: "Untitled"
+author: "Shaya Engelman"
+date: "2024-06-21"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+setwd("C:/Users/shaya/OneDrive/Documents/repos/Data624")
+```
+
+```{r}
+library(tidyverse)
+library(readxl)
+library(here)
+library(tsibble)
+library(fable)
+library(ggcorrplot)
+library(forecast)
+library(tseries)
+library(zoo)
+library(writexl)
+```
+
+# Load data
+
+```{r}
+complete_data <- read_excel(here("Project_1", "Prompt", "Data Set for Class.xls"))
+
+# Split the data into 6 different data frames by the column "category"
+data_list <- split(complete_data, complete_data$category)
+
+# Extract category three
+category_three <- data_list$`S03` |>
+    select(-category) # drop the category column
+
+summary(category_three)
+```
+
+# Data Exploration
+
+## Exploring the relationship between all variables
+
+For this project, only variables 'Var05' and 'Var07' will be forecasted. However, it can still be useful to explore the other variables to see if there are any insights.
+
+```{r}
+# Plot the five variables as faceted plots to allow for different scales on the y-axis
+category_three |>
+  pivot_longer(cols = -SeriesInd, names_to = "variable", values_to = "value") |>
+  ggplot(aes(x = SeriesInd, y = value, color = variable)) +
+  geom_line() +
+  labs(title = "Time Series Plot", x = "Date", y = "Value", color = "Variable") +
+  theme_minimal() +
+  facet_wrap(~ variable, scales = "free_y", ncol = 1)
+```
+
+The above plots reveal an almost perfect correlation between variables Var01, Var03, Var05, and Var07. Var02 seems to be something entirely different and on a much larger scale. To confirm the relationship between the variables, I will recreate this plot with those variables stacked on the same set of axes, additionally, I will calculate the correlation between them.
+
+```{r}
+category_three |>
+  pivot_longer(cols = -SeriesInd, names_to = "variable", values_to = "value") |>
+  filter(variable %in% c("Var01", "Var03", "Var05", "Var07")) |>
+  ggplot(aes(x = SeriesInd, y = value, color = variable)) +
+  geom_line() +
+  labs(title = "Time Series Plot", x = "Date", y = "Value", color = "Variable") +
+  theme_minimal()
+```
+
+```{r}
+# Compute correlation matrix
+category_three |>
+  select(Var01, Var02, Var03, Var05, Var07) |>
+  na.omit() |> # cor() does not handle missing values
+  cor() |>
+  ggcorrplot(lab = TRUE)
+```
+
+The above plots confirm the practically perfect correlation between Var01, Var03, Var05, and Var07 and also reveal a pretty significant negative correlation between Var02 and the other variables. Moreover, the stacked lineplots reveal that variables Var01, Var03, Var05, and Var07 are not just extremely correlated, but also have almost the same values. This suggests that they are essentially the same variable, just with different names. This allows me to not worry about them being confounding variables when trying to forecast individual variables and also allows me to use other variables to fill in missing values.
+
+## Summary statistics
+
+The first step in analyzing the data is to generate summary statistics for the variables to be forecasted, 'Var05' and 'Var07'. First, I will convert the data to a tsibble object to have the data in a format that is easier to work with for time series analysis. 
+
+```{r}
+cat3_var5_var7 <- category_three |>
+  select(SeriesInd, Var05, Var07)
+
+# Convert to tsibble
+cat3_var5_var7 <- as_tsibble(cat3_var5_var7, index = SeriesInd) 
+
+# Check the tsibble object
+length(cat3_var5_var7$SeriesInd)
+
+# Summary statistics
+summary(cat3_var5_var7)
+```
+
+The summary statistics reveal some interesting information. We again see the two variables have almost identical values. For this tsibble object, I've set the 'SeriesInd' column as the index. Since the data is completely deidentified, I do not know exactly what the 'SeriesInd' column represents. The actual values appear to be Excel date serials (the number of days since December 30, 1899), but since this is not confirmed, I will leave them as an index unless there is a reason to change them. An interesting observation is that while the SeriesInd column does not have any missing values, it isn't completely continuous. The data ranges from 40669 to 43221, which is a range of 2552 observations, however the length of the data is only 1762. Since this isn't showing up as missing values, the data for those rows must be entirely missing from the dataset. A quick glance through the data seems to suggest a pattern of five consecutive indices, followed by a jump of 2 indices. This is something to keep in mind when working with the data and further suggests that the index is a date column only measuring business days.
+
+We also see 144 missing values for both 'Var05' and 'Var07'. This is due to there being 140 extra rows that we will be forcasting for. This leaves us with 4 rows of missing data. By printing the rows, we see that both 'Var05' and 'Var07' are missing for the same rows. This does not allow us to use the other variable to fill in the missing values. Since there are only 4 rows out of 1622, the method of imputation will not have a significant impact on the forecast. I will use the 'na.approx()' function from the zoo package to fill in the missing values. The na.approx() function will fill in the missing values with the midpoint of the two closest non-missing values.
+
+```{r}
+# Remove last 140 rows
+n <- nrow(cat3_var5_var7)
+cat3_train <- cat3_var5_var7[-c((n-139):n), ]
+
+# Print the rows of missing values
+cat3_train |>
+  filter(is.na(Var05) | is.na(Var07))
+
+# Impute missing values
+cat3_train$Var05 <- na.approx(cat3_train$Var05)
+cat3_train$Var07 <- na.approx(cat3_train$Var07)
+
+# Check for missing values to make sure they were filled in
+cat3_train |>
+  filter(is.na(Var05) | is.na(Var07))
+```
+
+After handling the missing values with a more robust method, I will now add the implicitly missing rows into the data and fill them in with the data from the last row. I specifically am not using the same method as before because for these missing values, there likely was 0 of whatever the data is measuring (sales or stock price or whatever). Using an average of the two closest values would not be appropriate in this case.
+
+```{r}
+# Add the implicitly missing rows
+cat3_train <- cat3_train |> 
+  fill_gaps()
+
+# Fill NAs with the last value
+cat3_train$Var05 <- na.locf(cat3_train$Var05)
+cat3_train$Var07 <- na.locf(cat3_train$Var07)
+
+# Check for missing values
+cat3_train |>
+  filter(is.na(Var05) | is.na(Var07))
+```
+
+## Visualizing the variables to be forecasted
+
+We now move onto basic exploration of the variables to be forecasted, 'Var05' and 'Var07'. Since they appear to be practically identical, they will be explored and worked with together until there seems to be a reason to treat them differently.
+
+```{r}
+# Save as separate time series objects
+var5 <- ts(cat3_train$Var05)
+var7 <- ts(cat3_train$Var07)
+
+# Plot the two variables
+ggplot() +
+  geom_point(aes(x = cat3_train$SeriesInd, y = var5), color = "blue", alpha = 0.95) +
+  geom_point(aes(x = cat3_train$SeriesInd, y = var7), color = "red", alpha = 0.5) +
+  labs(title = "Time Series Plot", x = "Date", y = "Value", color = "Variable") +
+  theme_minimal()
+```
+
+There does not seem to be any major outliers in the data that need to be addressed. 
+
+The data does display an overall upward trend with significant variability. Initially, the data seems to have very minor fluctuationsm, but later on, the variability increases significantly. Additionally, the data seems to have an either seasonal or cyclical component, with the data appearing to have a pattern of peaks and valleys.
+
+# Data Prep
+
+## Seasonality
+
+To determine the seasonality of the data, I will use the 'findfrequency()' function from the forecast package. The 'findfrequency()' function will return the frequency of the data, which will allow me to determine the seasonality of the data. The frequency of the data is the number of observations per season or cycle.
+
+```{r}
+findfrequency(var5)
+findfrequency(var7)
+```
+
+The frequency of the data is 1, which means that the data is non-seasonal. 
+
+## Stationarity
+
+The above plot clearly showed the data is not stationary, meaning, the variance of the data changes as the plot goes on. This can be further determined by using the 'adf.test()' function from the tseries package. The Augmented Dickey-Fuller test is a statistical test that tests the null hypothesis that a unit root is present in a time series sample. If the p-value is less than 0.05, then the null hypothesis is rejected, and the data is stationary.
+
+```{r}
+adf.test(var5)
+adf.test(var7)
+```
+
+As we can see, the p-value is extremely high, implying that the data is not stationary. We will need to make the data stationary before we can proceed with forecasting.
+
+we will use the ndiffs() function from the forecast package to determine the number of differences needed to make the data stationary. We expect the number of differences to be 1, as the data is non-seasonal.
+
+```{r}
+ndiffs(var5)
+ndiffs(var7)
+
+# Take the first difference
+diff_var5 <- diff(var5)
+diff_var7 <- diff(var7)
+
+# Plot the differenced data
+ggplot() +
+  geom_line(aes(x = cat3_train$SeriesInd[-1], y = diff_var5), color = "blue", alpha = 0.5) +
+  geom_line(aes(x = cat3_train$SeriesInd[-1], y = diff_var7), color = "red", alpha = 0.5) +
+  labs(title = "Time Series Plot", x = "Date", y = "Value", color = "Variable") +
+  theme_minimal()
+```
+
+After differencing the data, we can rerun the Augmented Dickey-Fuller test to determine if the data is now stationary.
+
+```{r}
+adf.test(diff_var5)
+adf.test(diff_var7)
+```
+
+We now see that the p-value is extremely low, implying that the data is now stationary. We can also view this in the above plot, where we see the mean of the data is now constant. We do note two periods of high variability in the data, but the mean is constant.
+
+## ACF and PACF
+
+The next step in the analysis is to make sure there is no longer any autocorrelation in the data. We can do this by plotting the autocorrelation function (ACF) and partial autocorrelation function (PACF) of the data. The ACF and PACF plots will show the correlation between the data and its lagged values. If the data is stationary, then the ACF and PACF plots should show no correlation between the data and its lagged values. Here, we got slightly different results for the two variables so I will discuss them separately.
+
+```{r}
+# ACF and PACF plots
+acf(diff_var5, plot = T)
+pacf(diff_var5, plot = F)
+```
+
+The ACF and PACF plots show autocorrelation only at lag 1, which is expected for stationary data. All the other lags are within the confidence interval (the area between the blue lines), which means they are not statistically significant. This implies that the data is stationary and there is no autocorrelation in the data.
+
+
+```{r}
+acf(diff_var7, plot = T)
+pacf(diff_var7, plot = T)
+```
+
+The ACF and PACF plots of var7 do not spike at lag 1. Instead there seems to be no significant autocorrelation in the data. There is a relatively small spike at lag 5, lag 20 and around lag 28, but none of these are too large and can probably safely be ignored. The rest of the lags are within the confidence interval, which means they are not statistically significant.
+
+Based on the above analysis, I will assume that the data is now stationary and has no autocorrelation. I will now move on to modeling the data. Since there was a slight difference in the ACF and PACF plots for the two variables, I will model them separately.
+
+# Modeling
+
+## Variable 5
+
+## ARIMA
+
+I will start by fitting an ARIMA model to the data. I will use the auto.arima() function from the forecast package to automatically select the best ARIMA model for the data. The auto.arima() function will select the best ARIMA model based on the AIC value. The AIC value is a measure of the goodness of fit of the model. The lower the AIC value, the better the model.
+
+```{r}
+# Fit ARIMA model
+arima_var5 <- auto.arima(diff_var5)
+arima_var5
+```
+
+The auto.arima() function selected an ARIMA(1,0,0) model for the data. This means that the model has an autoregressive term of 1 and no moving average terms. This model does not capture any of the overall trend in the actual data. In our original plots, we saw that the data had an overall upward trend. This makes the model useful for forecasting the short-term fluctuations in the data, but not longer-term trends. I will try to incorporate the trend into the model by using an external regressor and see if the model improves or not.
+
+```{r}
+# Adjust the length of the external regressor to match diff_var5
+trend <- cat3_train$SeriesInd[-1]
+
+# Fit the ARIMA model with the external regressor
+fit_arima_xreg <- auto.arima(var5, xreg = cat3_train$SeriesInd)
+fit_arima_xreg
+```
+
+The auto.arima() function selected the same ARIMA(1,0,0) model for the data. This means that the external regressor did not improve the model.
+
+The arima model (1,1,0) on the original data is completely equivalant to the arima model (1,0,0) on the differenced data. This is because the differencing operation is equivalent to the first order autoregressive operation. Therefore, we might as well use the arima model on the original data. This way it will be easier to interpret the forecasts.
+
+```{r}
+# Fit ARIMA model
+arima_var5 <- auto.arima(var5)
+arima_var5
+```
+
+## ETS 
+
+Next, I will fit an ETS model to the data. I will use the ets() function from the forecast package to automatically select the best ETS model for the data. The ets() function will select the best ETS model based on the AIC value. The ets() function does not require the data to be differenced, so I will use both the differenced and original data to fit two separate models.
+
+```{r}
+# Fit ETS model
+ets_var5_diff <- ets(diff_var5)
+ets_var5_diff
+```
+
+The ets() function selected an ETS(A,N,N) model for the differenced data. This means that the model has an additive error term and no trend or seasonality. This is the same as the ARIMA(1,0,0) model that was selected earlier and since the data was differenced to make it stationary, this is expected.
+
+```{r}
+ets_var5 <- ets(var5)
+ets_var5
+```
+
+The ets() function selected an ETS(M,A,N) model for the original data. This means that the model has multiplicative error term, an additive trend, and no seasonality. This model captures the overall trend in the data, which can be an improvement over the ARIMA model, particularly for longer-term forecasts. 
+
+## Naive with drift
+
+Lastly, I will fit a naive forecast with drift model to the data. The naive forecast with drift model is a simple model that forecasts the data as the last observed value plus the average change in the data. This model is useful for short-term forecasts where the data is expected to continue its current trend.
+
+```{r}
+# Fit naive forecast with drift model
+naive_forecast <- naive(var5)
+naive_forecast
+```
+
+## Model Comparison
+
+I will now compare the ARIMA, both ETS models, and the naive forecast with drift model to see which model performs the best. 
+
+```{r}
+# Create a data frame to compare the models
+model_comparison <- data.frame(
+  Model = c("ARIMA", "ETS(A,N,N)", "ETS(M,A,N)"),
+  AIC = c(arima_var5$aic, ets_var5_diff$aic, ets_var5$aic),
+  AICc = c(arima_var5$aicc, ets_var5_diff$aicc, ets_var5$aicc),
+  BIC = c(arima_var5$bic, ets_var5_diff$bic, ets_var5$bic),
+  Log_Likelihood = c(arima_var5$loglik, ets_var5_diff$loglik, ets_var5$loglik)
+)
+
+# Print the model comparison table
+print(model_comparison)
+```
+
+The arima model has the lowest AIC, AICc, and BIC values, meaning, it has the best fit to the data it also has the highest log likelihood, which is also a good sign. These suggest that the ARIMA model is the best model for the data. However, for forecasting multiple future periods, the ETS(M,A,N) model might be better as it captures the overall trend in the data, as opposed to the arima which will predict the same value for all future periods.
+
+## Residuals
+
+Before moving on to forecasting, I will check the residuals of the ETS model to make sure they are white noise. I will use the checkresiduals() function from the forecast package to check the residuals.
+
+```{r}
+# Residuals for ARIMA(1,0,0)
+checkresiduals(ets_var5)
+```
+
+The plots of the residuals are encouraging. The residuals have zero mean, are normally distributed and do not seem to have any alarming spikes at different lag points I will now move on to forecasting the data.
+
+## Forecasting
+
+I will now generate forecasts for the next 200 periods using the ETS model. The goal of this project is to forecast the data for the next 140 periods, but since I imputed the implicitly missing rows, I will forecast for 200 periods to account for the extra rows and achieve 140 forecasts not counting the imputed rows.
+
+```{r}
+summary(ets_var5)
+# Generate predictions for the next 200 periods
+ets_var5_forecast <- forecast(ets_var5, h = 200)
+ets_var5_forecast$mean
+```
+
+```{r}
+plot(ets_var5_forecast)
+```
+
+
+These forecasts look to be around the range we would expect the data to go into, including the longer-term trends we could not capture that with the ARIMA model. The forecasts are also quite wide, which is expected given the high variability in the data.
+
+I will now forecast specific points instead of the PI to generate actual predictions, and compare it with predicitons based on a naive with drift forecast.
+
+```{r}
+naive_forecast <- naive(var5, h = 200)
+
+# Plot the forecasts
+plot(ets_var5_forecast, PI = F)
+lines(naive_forecast$mean, col = "red")
+```
+
+The naive forecast with drift model seems to be a bit more conservative than the ETS model, and is likely to be more accurate for the short-term forecasts, but for that, the ARIMA model would be even better. For our purposes, the ETS model is likely the best model to use for forecasting the data.
+
+# Insert forecasts
+
+I will now insert the forecasts back into the original data.
+
+```{r}
+# Add the forecasts to the original data
+# Ensure the forecast has the same time index as the original series
+ets_var5_forecast$mean <- ts(ets_var5_forecast$mean, start = start(var5), frequency = frequency(var5))
+
+# Now you can add them together
+var5_complete <- c(var5, ets_var5_forecast$mean)
+```
+
+```{r}
+length(var5)
+length(ets_var5_forecast$mean)
+length(var5_complete)
+```
+
+```{r}
+# Convert the forecasts to a dataframe to bind with the category_three dataframe
+var5_complete_df <- data.frame(
+  SeriesInd = time(var5_complete, origin = "1899-12-30"),
+  Var05 = as.numeric(var5_complete)
+)
+
+var5_complete_df$SeriesInd <- as.numeric(var5_complete_df$SeriesInd) + 40668
+
+# Replace Var05 in category_three with Var05 from var5_complete
+category_three_test <- category_three |>
+  left_join(var5_complete_df, by = "SeriesInd") |>
+  select(-Var05.x) |>
+  rename(Var05 = Var05.y)
+
+# Check the updated category_three
+tail(category_three_test)
+```
+
+I have now successfully added my forecasts to the data.
+
+
+## Variable 7
+
+I will follow a similar process as for Var05 unless a reason to do otherwise presents itself. Remember, the data for Var07 is practically identical to the data for Var05, so it would make sense to follow a similar process.
+
+```{r}
+# Fit ARIMA model
+arima_var7_diff <- auto.arima(diff_var7)
+arima_var7_diff
+```
+
+I again started with using auto.arima() on the differenced data. The auto.arima() function selected an ARIMA(0,0,0) model for the data. This means that the model has no autoregressive or moving average terms. This finding of an arima model is very interesting. It suggests that the data is a random walk, which is a time series model where the data has no overall trend but the original exploration of the data did seem to reveal a trend.
+
+Similar to the previous variable, since the only transformations we did were first order differencing, the arima model (0,1,0) on the original data is completely equivalent to the arima model (0,0,0) on the differenced data. Therefore, we might as well use the arima model on the original data. This way it will be easier to interpret the forecasts.
+
+```{r}
+arima_var7 <- auto.arima(var7)
+arima_var7
+```
+
+I will now manually create a different arima model. I will use the same order as I used for Var05 as the data seemed to be extremely similar.
+
+```{r}
+# Fit ARIMA model
+arima_var7_man <- Arima(var7, order = c(1,0,0))
+arima_var7_man
+```
+
+I will also try using the order found by auto.arima() but adding a drift term to the model. 
+
+```{r}
+# Fit ARIMA model
+arima_var7_drift <- Arima(var7, order = c(0,1,0), include.drift = T)
+arima_var7_drift
+```
+
+Lastly, I will fit an ETS model to the data. 
+
+```{r}
+# Fit ETS model
+ets_var7 <- ets(var7)
+ets_var7
+```
+
+I will now compare the ARIMA and ETS models to see which model performs the best.
+
+```{r}
+# Create a data frame to compare the models
+model_comparison_var7 <- data.frame(
+  Model = c("AUTO.ARIMA", "ARIMA(1,0,0)", "ARIMA(0,1,0) with drift", "ETS"),
+    AIC = c(arima_var7$aic, arima_var7_man$aic, arima_var7_drift$aic, ets_var7$aic),
+    AICc = c(arima_var7$aicc, arima_var7_man$aicc, arima_var7_drift$aicc, ets_var7$aicc),
+    BIC = c(arima_var7$bic, arima_var7_man$bic, arima_var7_drift$bic, ets_var7$bic),
+    Log_Likelihood = c(arima_var7$loglik, arima_var7_man$loglik, arima_var7_drift$loglik, ets_var7$loglik)
+)
+
+# Print the model comparison table
+print(model_comparison_var7)
+```
+
+The arima model with drift is only very slightly worse by these metrics than the auto.arima model. However, it would likely do better for multiple forecasts as it can handle some of the trend, unlike the auto.arima model. 
+
+I will now check the residuals of the ARIMA model with drift to make sure they are white noise.
+
+```{r}
+# Residuals for ARIMA(0,1,0) with drift
+checkresiduals(arima_var7_drift)
+```
+
+The plots of the residuals are encouraging. The residuals have zero mean, are normally distributed and do not seem to have any alarming spikes at different lag points. 
+
+I will now generate forecasts for the next 200 periods using the ARIMA model with drift.
+
+```{r}
+# Generate predictions for the next 200 periods
+arima_var7_forecast <- forecast(arima_var7_drift, h = 200)
+arima_var7_forecast$mean
+```
+
+```{r}
+plot(arima_var7_forecast)
+```
+
+The forecasts look to be around the range we would expect the data to go into, including the longer-term trends we could not capture that with the basic ARIMA model. The forecasts are also quite wide, which is expected given the high variability in the data.
+
+```{r}
+# Add the forecasts to the original data
+# Ensure the forecast has the same time index as the original series
+arima_var7_forecast$mean <- ts(arima_var7_forecast$mean, start = start(var7), frequency = frequency(var7))
+
+# Now you can add them together
+var7_complete <- c(var7, arima_var7_forecast$mean)
+```
+
+```{r}
+length(var7)
+length(arima_var7_forecast$mean)
+length(var7_complete)
+```
+
+```{r}
+# Convert the forecasts to a dataframe to bind with the category_three dataframe
+var7_complete_df <- data.frame(
+  SeriesInd = time(var7_complete, origin = "1899-12-30"),
+  Var07 = as.numeric(var7_complete)
+)
+
+var7_complete_df$SeriesInd <- as.numeric(var7_complete_df$SeriesInd) + 40668
+
+# Replace Var05 in category_three with Var05 from var5_complete
+category_three_test2 <- category_three_test |>
+  left_join(var7_complete_df, by = "SeriesInd") |>
+  select(-Var07.x) |>
+  rename(Var07 = Var07.y)
+
+# Check the updated category_three
+tail(category_three_test2)
+```
+
+I have now successfully added my forecasts to the data for Var07 as well.
+
+```{r}
+# Save the updated data
+write_xlsx(category_three_test2, here("Project_1", "Prompt", "category_three_forecasted.xlsx"))
+```
